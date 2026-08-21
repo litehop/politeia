@@ -407,7 +407,7 @@ where
 pub fn drain_watch_buffer(buf: &mut String, handler: &mut impl FnMut(Value)) {
     while let Some(nl) = buf.find('\n') {
         let line = buf[..nl].trim().to_owned();
-        *buf = buf[nl + 1..].to_owned();
+        buf.drain(..=nl);
         if line.is_empty() {
             continue;
         }
