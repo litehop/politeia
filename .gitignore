@@ -1,0 +1,21 @@
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+
+target
+ai/worktrees/
+.aqua/
+
+# Local dev state
+temp/*
+!temp/.gitkeep
+
+.claude/scheduled_tasks.json
+.claude/scheduled_tasks.lock
+.claude/plans/
+.claude/mayor-tick-state.json
+
+# Critical-reviewer queue: hook writes review-request markers here; ephemeral.
+.claude/review-queue/*
+!.claude/review-queue/.gitkeep
