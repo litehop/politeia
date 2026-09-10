@@ -1,8 +1,14 @@
 [package]
-name    = "u7s-kubeconfig"
-version = "0.1.0"
-edition = "2021"
-license = "Apache-2.0"
+name        = "politeia"
+version     = "0.1.0"
+edition     = "2021"
+license     = "Apache-2.0"
+description = "kubeconfig parsing, mTLS TlsConnector construction, and a minimal hyper HTTP/1.1 API client with watch-streaming"
+repository  = "https://github.com/litehop/politeia"
+readme      = "README.md"
+keywords    = ["kubernetes", "kubeconfig", "tls", "mtls", "rustls"]
+categories  = ["api-bindings", "network-programming"]
+exclude     = ["/temp", "/.claude", "/ai"]
 
 [dependencies]
 anyhow          = "1"
