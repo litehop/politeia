@@ -1,8 +1,8 @@
-/// u7s-kubeconfig — kubeconfig parsing and TLS client construction.
+/// politeia — kubeconfig parsing and TLS client construction.
 ///
-/// u7s-scheduler needs to read a kubeconfig file, extract TLS credentials,
-/// and build a tokio-rustls TlsConnector for mTLS connections to the API
-/// server. This crate holds that logic separately from the scheduler binary.
+/// Reads a kubeconfig file, extracts TLS credentials, and builds a tokio-rustls
+/// TlsConnector for mTLS connections to a Kubernetes-style API server. Also
+/// provides a minimal hyper HTTP/1.1 API client with watch-streaming support.
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -30,7 +30,8 @@ pub struct ClientCreds {
 /// Parse a kubeconfig file and return TLS credentials.
 ///
 /// Performs manual YAML field extraction without a serde_yaml dependency.
-/// The format is the fixed structure written by u7s-apiserver's tls.rs.
+/// Expects the fixed kubeconfig structure with inline base64 CA cert, client
+/// cert, and client key data.
 pub fn parse_kubeconfig(path: &str) -> anyhow::Result<ClientCreds> {
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("reading kubeconfig {path}"))?;
@@ -111,10 +112,10 @@ pub fn build_tls_connector(creds: &ClientCreds) -> anyhow::Result<TlsConnector> 
 }
 
 // ---------------------------------------------------------------------------
-// HyperApiClient — HTTP/1.1 over TLS client for u7s-scheduler
+// HyperApiClient — HTTP/1.1 over TLS client
 //
-// The `bearer` field supports an optional auth header; scheduler always
-// passes `None` today.
+// The `bearer` field supports an optional auth header; callers pass `None`
+// when using mTLS client-cert auth alone.
 // ---------------------------------------------------------------------------
 
 /// A minimal HTTP/1.1 mTLS API client backed by hyper.
@@ -183,7 +184,7 @@ impl HyperApiClient {
     /// Send an HTTP request and return the response body as bytes.
     ///
     /// The body is always fully buffered. For streaming responses use
-    /// [`watch_stream`].
+    /// [`Self::watch_stream`].
     pub async fn request(
         &self,
         method: Method,
@@ -201,7 +202,7 @@ impl HyperApiClient {
     /// (the apiserver's `accepts_patch_content_type` requires
     /// `application/merge-patch+json` or `application/strategic-merge-patch+json`,
     /// returning 415 otherwise), so callers that PATCH `.../status` need to
-    /// override it rather than go through [`request`].
+    /// override it rather than go through [`Self::request`].
     pub async fn request_with_content_type(
         &self,
         method: Method,
@@ -400,10 +401,8 @@ where
 /// Lines that fail to parse are logged and skipped. Incomplete lines (no
 /// trailing `\n`) are left in `buf` for the next call.
 ///
-/// This function is the canonical implementation used by `HyperApiClient::watch_stream`.
-/// It is also re-exported from `u7s-scheduler` so that scheduler-level code can
-/// reference the same function — ensuring unit tests for the parsing logic cover
-/// the actual production code path.
+/// This function is the canonical implementation used by `HyperApiClient::watch_stream`
+/// and is exported so callers can reuse the exact same watch-event parsing logic.
 pub fn drain_watch_buffer(buf: &mut String, handler: &mut impl FnMut(Value)) {
     while let Some(nl) = buf.find('\n') {
         let line = buf[..nl].trim().to_owned();
