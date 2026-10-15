@@ -153,6 +153,23 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// few minutes instead of never.
 const WATCH_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
+/// Turn a URI host into the TLS server name to verify the certificate against.
+///
+/// `hyper::Uri::host()` keeps the brackets of an IPv6 literal (`[fd00::1]`),
+/// which is not a valid DNS name; strip them and verify against an IP SAN.
+/// Zone IDs (`fe80::1%eth0`) are rejected: a certificate cannot carry one.
+fn tls_server_name(host: &str) -> anyhow::Result<rustls::pki_types::ServerName<'static>> {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return Ok(rustls::pki_types::ServerName::IpAddress(ip.into()));
+    }
+    rustls::pki_types::ServerName::try_from(host.to_owned())
+        .with_context(|| format!("invalid TLS server name {host:?}"))
+}
+
 impl HyperApiClient {
     /// Parse `server` + `path` into (host, port) for TCP connect.
     fn parse_addr(server: &str, path: &str) -> anyhow::Result<(String, u16, String)> {
@@ -172,7 +189,7 @@ impl HyperApiClient {
         let stream = TcpStream::connect(addr)
             .await
             .with_context(|| format!("TCP connect to {addr}"))?;
-        let server_name = host.to_owned().try_into().context("invalid DNS name")?;
+        let server_name = tls_server_name(host)?;
         let tls = self
             .connector
             .connect(server_name, stream)
@@ -1067,6 +1084,117 @@ mod tests {
             .expect("must parse");
         assert_eq!(uri.host(), Some("10.0.0.1"));
         assert_eq!(uri.port_u16(), Some(6443));
+    }
+
+    /// A bracketed IPv6 literal must become an IP server name; as a DNS name it
+    /// is rejected, so every dual-stack/IPv6 control-plane endpoint would fail
+    /// at TLS setup.
+    #[test]
+    fn tls_server_name_strips_ipv6_brackets_and_accepts_any_hex_case() {
+        use rustls::pki_types::ServerName;
+        let expect = |s: &str| -> ServerName<'static> {
+            ServerName::IpAddress(s.parse::<std::net::IpAddr>().unwrap().into())
+        };
+        assert_eq!(tls_server_name("[fd00::1]").unwrap(), expect("fd00::1"));
+        assert_eq!(
+            tls_server_name("[FD00::ABCD]").unwrap(),
+            expect("fd00::abcd")
+        );
+        assert_eq!(tls_server_name("fd00::1").unwrap(), expect("fd00::1"));
+        assert_eq!(tls_server_name("10.0.0.1").unwrap(), expect("10.0.0.1"));
+        assert_eq!(
+            tls_server_name("kubernetes.default").unwrap(),
+            ServerName::try_from("kubernetes.default").unwrap()
+        );
+    }
+
+    #[test]
+    fn tls_server_name_rejects_zone_ids_and_garbage() {
+        assert!(tls_server_name("[fe80::1%eth0]").is_err());
+        assert!(tls_server_name("[not-an-ip]").is_err());
+        assert!(tls_server_name("").is_err());
+    }
+
+    /// Non-default port, default port and IPv6 literal all yield a connectable
+    /// `host:port` (brackets kept for the socket address).
+    #[test]
+    fn parse_addr_handles_ipv6_ports_and_default_port() {
+        let (h, p, a) = HyperApiClient::parse_addr("https://[fd00::1]:6443", "/x").unwrap();
+        assert_eq!(
+            (h.as_str(), p, a.as_str()),
+            ("[fd00::1]", 6443, "[fd00::1]:6443")
+        );
+        let (h, p, a) = HyperApiClient::parse_addr("https://[fd00::1]", "/x").unwrap();
+        assert_eq!(
+            (h.as_str(), p, a.as_str()),
+            ("[fd00::1]", 443, "[fd00::1]:443")
+        );
+        let (h, p, a) = HyperApiClient::parse_addr("https://10.0.0.1:8443", "/x").unwrap();
+        assert_eq!(
+            (h.as_str(), p, a.as_str()),
+            ("10.0.0.1", 8443, "10.0.0.1:8443")
+        );
+        assert!(
+            HyperApiClient::parse_addr("https://[fe80::1%eth0]:6443", "/x").is_err()
+                || tls_server_name(
+                    HyperApiClient::parse_addr("https://[fe80::1%eth0]:6443", "/x")
+                        .unwrap()
+                        .0
+                        .as_str()
+                )
+                .is_err()
+        );
+    }
+
+    /// Full handshake against `[::1]` with a cert that only carries an IP SAN.
+    #[tokio::test]
+    async fn connect_verifies_ipv6_literal_against_ip_san() {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
+        rustls_post_quantum::provider().install_default().ok();
+
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::default();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = Issuer::new(ca_params, ca_key);
+        let leaf_key = KeyPair::generate().unwrap();
+        let mut leaf_params = CertificateParams::default();
+        leaf_params.subject_alt_names = vec![rcgen::SanType::IpAddress("::1".parse().unwrap())];
+        let leaf = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
+
+        let server_cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![leaf.der().clone()],
+                PrivateKeyDer::Pkcs8(leaf_key.serialize_der().into()),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
+        let listener = tokio::net::TcpListener::bind("[::1]:0")
+            .await
+            .expect("IPv6 loopback must be available");
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            acceptor.accept(tcp).await.map(|_| ())
+        });
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca_cert.der().clone()).unwrap();
+        let client_cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let client = HyperApiClient {
+            server: format!("https://[::1]:{port}"),
+            connector: TlsConnector::from(Arc::new(client_cfg)),
+            bearer: None,
+        };
+        let (host, _, addr) = HyperApiClient::parse_addr(&client.server, "/").unwrap();
+        client
+            .connect(&host, &addr)
+            .await
+            .expect("handshake against an IP-SAN cert must succeed for an IPv6 literal");
+        server.await.unwrap().expect("server side handshake");
     }
 
     /// Verify that the bearer token field on HyperApiClient is correctly stored.
