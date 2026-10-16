@@ -9,6 +9,7 @@ use anyhow::Context;
 use base64::Engine;
 use hyper::{Method, Request};
 use hyper_util::rt::TokioIo;
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::Value;
 use tokio::net::TcpStream;
@@ -51,18 +52,17 @@ pub fn parse_kubeconfig(path: &str) -> anyhow::Result<ClientCreds> {
     let key_pem = b64.decode(key_data.trim()).context("decode client key")?;
 
     // The kubeconfig fields hold base64(PEM); rustls needs DER.
-    // rustls_pemfile::certs() strips the PEM envelope and yields raw DER.
-    let ca_cert = rustls_pemfile::certs(&mut ca_pem.as_slice())
+    // pem_slice_iter strips the PEM envelope and yields raw DER.
+    let ca_cert = CertificateDer::pem_slice_iter(&ca_pem)
         .next()
         .context("no certificate in kubeconfig certificate-authority-data")?
         .context("parse CA cert PEM")?;
-    let client_cert = rustls_pemfile::certs(&mut cert_pem.as_slice())
+    let client_cert = CertificateDer::pem_slice_iter(&cert_pem)
         .next()
         .context("no certificate in kubeconfig client-certificate-data")?
         .context("parse client cert PEM")?;
-    let client_key = rustls_pemfile::private_key(&mut key_pem.as_slice())
-        .context("parse client key PEM")?
-        .context("no private key in kubeconfig client-key-data")?;
+    let client_key = PrivateKeyDer::from_pem_slice(&key_pem)
+        .context("parse private key in kubeconfig client-key-data")?;
 
     Ok(ClientCreds {
         server: server.trim().to_owned(),
@@ -275,7 +275,7 @@ pub fn in_cluster_client_from(
     let server = in_cluster_server_url(host, port)?;
     let ca_pem =
         std::fs::read(ca_path).with_context(|| format!("reading CA {}", ca_path.display()))?;
-    let cas = rustls_pemfile::certs(&mut ca_pem.as_slice())
+    let cas = CertificateDer::pem_slice_iter(&ca_pem)
         .collect::<Result<Vec<_>, _>>()
         .with_context(|| format!("parse CA PEM {}", ca_path.display()))?;
     let connector =
@@ -880,12 +880,36 @@ mod tests {
         let result = parse_kubeconfig(path.to_str().unwrap());
         assert!(result.is_err(), "non-PEM key must return Err");
         let msg = format!("{:#}", result.err().unwrap());
-        // Either "parse client key PEM" (parse error) or "no private key" (empty result).
         assert!(
-            msg.contains("parse client key") || msg.contains("no private key"),
+            msg.contains("private key"),
             "error must describe key failure; got: {msg}"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A client-certificate-data that decodes to PEM with no CERTIFICATE block must
+    /// be rejected at parse time; otherwise mTLS would present an empty chain and
+    /// fail only at handshake with an opaque error.
+    #[test]
+    fn parse_kubeconfig_client_cert_without_certificate_block_errors() {
+        let (ca_pem, _, key_pem) = make_test_certs();
+        let yaml = make_kubeconfig_yaml(
+            "https://127.0.0.1:6443",
+            &ca_pem,
+            "not a certificate\n",
+            &key_pem,
+        );
+        let path = write_temp_file(&yaml, "empty-chain");
+        let result = parse_kubeconfig(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        let msg = format!(
+            "{:#}",
+            result.err().expect("empty cert chain must return Err")
+        );
+        assert!(
+            msg.contains("no certificate in kubeconfig client-certificate-data"),
+            "error must name the empty client cert field; got: {msg}"
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -1146,19 +1170,17 @@ mod tests {
             use rustls::pki_types::{CertificateDer, PrivateKeyDer};
             use rustls::ClientConfig;
 
-            let server_ca_der = rustls_pemfile::certs(&mut server_ca_pem.as_bytes())
+            let server_ca_der = CertificateDer::pem_slice_iter(server_ca_pem.as_bytes())
                 .next()
                 .expect("server CA cert")
                 .expect("parse server CA DER");
             let client_cert_der: CertificateDer<'static> =
-                rustls_pemfile::certs(&mut client_cert_pem.as_bytes())
+                CertificateDer::pem_slice_iter(client_cert_pem.as_bytes())
                     .next()
                     .expect("client cert")
                     .expect("parse client cert DER");
             let client_key: PrivateKeyDer<'static> =
-                rustls_pemfile::private_key(&mut client_key_pem.as_bytes())
-                    .expect("parse client key")
-                    .expect("client key");
+                PrivateKeyDer::from_pem_slice(client_key_pem.as_bytes()).expect("client key");
 
             let mut root_store = rustls::RootCertStore::empty();
             root_store.add(server_ca_der).expect("add server CA");
@@ -1511,7 +1533,7 @@ mod tests {
     fn bearer_source_file_yields_authorization_header_with_current_token() {
         let path = write_temp_file("abc", "token-header");
         let (ca_pem, _, _) = make_test_certs();
-        let ca = rustls_pemfile::certs(&mut ca_pem.as_bytes())
+        let ca = CertificateDer::pem_slice_iter(ca_pem.as_bytes())
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         let client = HyperApiClient {
