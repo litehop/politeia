@@ -146,13 +146,24 @@ pub const IN_CLUSTER_CA_PATH: &str = "/var/run/secrets/kubernetes.io/serviceacco
 /// the old one until expiry, so one minute leaves a wide safety margin.
 const TOKEN_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Cached-token age beyond which a failing refresh is logged at `error!`: the
+/// token is then likely near expiry and requests will start failing with 401.
+const TOKEN_STALE_ERROR_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+
+struct CachedToken {
+    token: String,
+    last_attempt: std::time::Instant,
+    last_success: std::time::Instant,
+}
+
 /// A bearer token read from a file that is rewritten in place over time
-/// (projected ServiceAccount token). The file is re-read at most once per
-/// refresh interval; a failed re-read keeps the previous token.
+/// (projected ServiceAccount token). The file is read at most once per
+/// refresh interval, whether or not the read succeeds; a failed re-read keeps
+/// the previous token.
 pub struct TokenFile {
     path: std::path::PathBuf,
     refresh: std::time::Duration,
-    cached: std::sync::Mutex<(String, std::time::Instant)>,
+    cached: std::sync::Mutex<CachedToken>,
 }
 
 fn read_token(path: &std::path::Path) -> anyhow::Result<String> {
@@ -177,24 +188,41 @@ impl TokenFile {
     ) -> anyhow::Result<Self> {
         let path = path.into();
         let token = read_token(&path)?;
+        let now = std::time::Instant::now();
         Ok(Self {
             path,
             refresh,
-            cached: std::sync::Mutex::new((token, std::time::Instant::now())),
+            cached: std::sync::Mutex::new(CachedToken {
+                token,
+                last_attempt: now,
+                last_success: now,
+            }),
         })
     }
 
-    /// The current token, re-read from disk if the cached one is stale.
+    /// The current token, re-read from disk if the last attempt is older than
+    /// the refresh interval.
     pub fn token(&self) -> String {
         let mut cached = self.cached.lock().unwrap_or_else(|e| e.into_inner());
-        if cached.1.elapsed() >= self.refresh {
+        if cached.last_attempt.elapsed() >= self.refresh {
+            let now = std::time::Instant::now();
+            cached.last_attempt = now;
             match read_token(&self.path) {
-                Ok(t) => *cached = (t, std::time::Instant::now()),
-                // Keep serving the last token; retry on the next call.
-                Err(e) => warn!("token refresh failed, reusing previous token: {e:#}"),
+                Ok(t) => {
+                    cached.token = t;
+                    cached.last_success = now;
+                }
+                Err(e) => {
+                    let age = cached.last_success.elapsed();
+                    if age >= TOKEN_STALE_ERROR_AFTER {
+                        error!("token refresh failing for {age:?}, serving stale token: {e:#}");
+                    } else {
+                        warn!("token refresh failed, reusing previous token: {e:#}");
+                    }
+                }
             }
         }
-        cached.0.clone()
+        cached.token.clone()
     }
 }
 
@@ -225,6 +253,10 @@ pub fn in_cluster_server_url(host: &str, port: &str) -> anyhow::Result<String> {
         .trim()
         .parse()
         .with_context(|| format!("invalid KUBERNETES_SERVICE_PORT {port:?}"))?;
+    anyhow::ensure!(
+        !host.contains('%'),
+        "IPv6 zone ids are not supported in KUBERNETES_SERVICE_HOST: {host:?}"
+    );
     if host.contains(':') && !host.starts_with('[') {
         Ok(format!("https://[{host}]:{port}"))
     } else {
@@ -1521,10 +1553,8 @@ mod tests {
     /// End to end: a CA-only client (no client cert) completes TLS against a
     /// server that does not ask for client auth and sends the ServiceAccount
     /// token as a bearer header.
-    #[tokio::test]
-    async fn in_cluster_client_authenticates_with_bearer_over_ca_only_tls() {
+    fn ic_test_server() -> (String, rustls::ServerConfig) {
         use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         rustls_post_quantum::provider().install_default().ok();
 
         let ca_key = KeyPair::generate().unwrap();
@@ -1545,6 +1575,13 @@ mod tests {
                 PrivateKeyDer::Pkcs8(leaf_key.serialize_der().into()),
             )
             .unwrap();
+        (pem_encode_str("CERTIFICATE", ca_cert.der()), server_cfg)
+    }
+
+    #[tokio::test]
+    async fn in_cluster_client_authenticates_with_bearer_over_ca_only_tls() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (ca_pem, server_cfg) = ic_test_server();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1560,7 +1597,7 @@ mod tests {
             String::from_utf8_lossy(&buf[..n]).into_owned()
         });
 
-        let ca_file = write_temp_file(&pem_encode_str("CERTIFICATE", ca_cert.der()), "ic-e2e-ca");
+        let ca_file = write_temp_file(&ca_pem, "ic-e2e-ca");
         let token_file = write_temp_file("sa-token\n", "ic-e2e-token");
         let client =
             in_cluster_client_from("127.0.0.1", &port.to_string(), &token_file, &ca_file).unwrap();
@@ -1576,5 +1613,59 @@ mod tests {
         );
         let _ = std::fs::remove_file(&ca_file);
         let _ = std::fs::remove_file(&token_file);
+    }
+
+    /// A server whose cert chains to a CA the client does not trust must be
+    /// rejected; otherwise a MITM could harvest the ServiceAccount token.
+    #[tokio::test]
+    async fn in_cluster_client_rejects_server_signed_by_untrusted_ca() {
+        let (_server_ca_pem, server_cfg) = ic_test_server();
+        let (other_ca_pem, _) = ic_test_server();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            acceptor.accept(tcp).await.is_err()
+        });
+
+        let ca_file = write_temp_file(&other_ca_pem, "ic-neg-ca");
+        let token_file = write_temp_file("sa-token", "ic-neg-token");
+        let client =
+            in_cluster_client_from("127.0.0.1", &port.to_string(), &token_file, &ca_file).unwrap();
+        let res = client
+            .request(hyper::Method::GET, "/api/v1/nodes", None)
+            .await;
+        assert!(res.is_err(), "unrelated CA must fail TLS verification");
+        assert!(
+            server.await.unwrap(),
+            "server must observe the client aborting the handshake"
+        );
+        let _ = std::fs::remove_file(&ca_file);
+        let _ = std::fs::remove_file(&token_file);
+    }
+
+    /// While the file stays unreadable, re-reads (and warnings) must be
+    /// limited to one per interval, not one per request.
+    #[test]
+    fn token_file_backs_off_after_failed_refresh() {
+        let path = write_temp_file("tok-1", "token-backoff");
+        let interval = std::time::Duration::from_millis(100);
+        let tf = TokenFile::with_refresh(&path, interval).unwrap();
+        std::thread::sleep(interval);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(tf.token(), "tok-1");
+        // Recovered file must not be seen until the interval passes again,
+        // proving the failed attempt was not retried immediately.
+        std::fs::write(&path, "tok-2").unwrap();
+        assert_eq!(tf.token(), "tok-1", "failed attempt must back off");
+        std::thread::sleep(interval);
+        assert_eq!(tf.token(), "tok-2");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn in_cluster_server_url_rejects_ipv6_zone_ids() {
+        assert!(in_cluster_server_url("fe80::1%eth0", "443").is_err());
     }
 }
