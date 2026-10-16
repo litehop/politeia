@@ -12,6 +12,9 @@ watch-streaming support for Kubernetes-style API servers.
 - **`build_tls_connector`** — build an mTLS `tokio_rustls::TlsConnector` from the
   parsed credentials, installing the ML-KEM-768 hybrid post-quantum key exchange
   provider (`rustls-post-quantum`).
+- **`in_cluster_client`** — build a `HyperApiClient` from the pod's ServiceAccount
+  (`KUBERNETES_SERVICE_HOST`/`_PORT`, `ca.crt`, rotating `token` re-read every
+  minute); TLS is CA-only (`build_ca_only_tls_connector`), no client cert.
 - **`HyperApiClient`** — a minimal HTTP/1.1-over-TLS client that opens a fresh
   connection per request; supports plain requests, custom content types, and
   newline-delimited JSON **watch streams**.

@@ -111,6 +111,165 @@ pub fn build_tls_connector(creds: &ClientCreds) -> anyhow::Result<TlsConnector> 
     Ok(TlsConnector::from(Arc::new(config)))
 }
 
+/// Build a CA-only TLS connector: the server is verified against `ca_certs`
+/// and no client certificate is presented (bearer-token authentication).
+pub fn build_ca_only_tls_connector(
+    ca_certs: &[CertificateDer<'static>],
+) -> anyhow::Result<TlsConnector> {
+    rustls_post_quantum::provider().install_default().ok();
+
+    let mut root_store = rustls::RootCertStore::empty();
+    for ca in ca_certs {
+        root_store
+            .add(ca.clone())
+            .context("add CA cert to root store")?;
+    }
+    anyhow::ensure!(!root_store.is_empty(), "no CA certificates supplied");
+
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    Ok(TlsConnector::from(Arc::new(config)))
+}
+
+// ---------------------------------------------------------------------------
+// Bearer tokens and in-cluster configuration
+// ---------------------------------------------------------------------------
+
+/// Default ServiceAccount token path inside a pod.
+pub const IN_CLUSTER_TOKEN_PATH: &str = "/var/run/secrets/kubernetes.io/serviceaccount/token";
+/// Default ServiceAccount CA bundle path inside a pod.
+pub const IN_CLUSTER_CA_PATH: &str = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
+
+/// How often a [`TokenFile`] re-reads its file. The kubelet refreshes a
+/// projected token at ~80% of its TTL (default 1h) and the apiserver accepts
+/// the old one until expiry, so one minute leaves a wide safety margin.
+const TOKEN_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A bearer token read from a file that is rewritten in place over time
+/// (projected ServiceAccount token). The file is re-read at most once per
+/// refresh interval; a failed re-read keeps the previous token.
+pub struct TokenFile {
+    path: std::path::PathBuf,
+    refresh: std::time::Duration,
+    cached: std::sync::Mutex<(String, std::time::Instant)>,
+}
+
+fn read_token(path: &std::path::Path) -> anyhow::Result<String> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading token file {}", path.display()))?;
+    let token = raw.trim();
+    anyhow::ensure!(!token.is_empty(), "token file {} is empty", path.display());
+    Ok(token.to_owned())
+}
+
+impl TokenFile {
+    /// Read the token now (failing if unreadable or empty) and re-read it
+    /// every minute thereafter.
+    pub fn new(path: impl Into<std::path::PathBuf>) -> anyhow::Result<Self> {
+        Self::with_refresh(path, TOKEN_REFRESH_INTERVAL)
+    }
+
+    /// Like [`Self::new`] with an explicit re-read interval.
+    pub fn with_refresh(
+        path: impl Into<std::path::PathBuf>,
+        refresh: std::time::Duration,
+    ) -> anyhow::Result<Self> {
+        let path = path.into();
+        let token = read_token(&path)?;
+        Ok(Self {
+            path,
+            refresh,
+            cached: std::sync::Mutex::new((token, std::time::Instant::now())),
+        })
+    }
+
+    /// The current token, re-read from disk if the cached one is stale.
+    pub fn token(&self) -> String {
+        let mut cached = self.cached.lock().unwrap_or_else(|e| e.into_inner());
+        if cached.1.elapsed() >= self.refresh {
+            match read_token(&self.path) {
+                Ok(t) => *cached = (t, std::time::Instant::now()),
+                // Keep serving the last token; retry on the next call.
+                Err(e) => warn!("token refresh failed, reusing previous token: {e:#}"),
+            }
+        }
+        cached.0.clone()
+    }
+}
+
+/// Source of the `Authorization: Bearer` token for a [`HyperApiClient`].
+pub enum BearerSource {
+    /// A fixed token.
+    Static(String),
+    /// A rotating token re-read from a file.
+    File(TokenFile),
+}
+
+impl BearerSource {
+    fn token(&self) -> String {
+        match self {
+            Self::Static(t) => t.clone(),
+            Self::File(f) => f.token(),
+        }
+    }
+}
+
+/// Server URL for the in-cluster apiserver from the
+/// `KUBERNETES_SERVICE_HOST` / `KUBERNETES_SERVICE_PORT` values. IPv6
+/// literals are bracketed.
+pub fn in_cluster_server_url(host: &str, port: &str) -> anyhow::Result<String> {
+    let host = host.trim();
+    anyhow::ensure!(!host.is_empty(), "KUBERNETES_SERVICE_HOST is empty");
+    let port: u16 = port
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid KUBERNETES_SERVICE_PORT {port:?}"))?;
+    if host.contains(':') && !host.starts_with('[') {
+        Ok(format!("https://[{host}]:{port}"))
+    } else {
+        Ok(format!("https://{host}:{port}"))
+    }
+}
+
+/// Build a client from in-cluster ServiceAccount credentials: server from
+/// `host`/`port`, CA bundle from `ca_path`, rotating token from `token_path`.
+pub fn in_cluster_client_from(
+    host: &str,
+    port: &str,
+    token_path: &std::path::Path,
+    ca_path: &std::path::Path,
+) -> anyhow::Result<HyperApiClient> {
+    let server = in_cluster_server_url(host, port)?;
+    let ca_pem =
+        std::fs::read(ca_path).with_context(|| format!("reading CA {}", ca_path.display()))?;
+    let cas = rustls_pemfile::certs(&mut ca_pem.as_slice())
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| format!("parse CA PEM {}", ca_path.display()))?;
+    let connector =
+        build_ca_only_tls_connector(&cas).with_context(|| format!("CA {}", ca_path.display()))?;
+    Ok(HyperApiClient {
+        server,
+        connector,
+        bearer: Some(BearerSource::File(TokenFile::new(token_path)?)),
+    })
+}
+
+/// [`in_cluster_client_from`] using the standard pod environment variables and
+/// ServiceAccount mount paths.
+pub fn in_cluster_client() -> anyhow::Result<HyperApiClient> {
+    let host = std::env::var("KUBERNETES_SERVICE_HOST")
+        .context("KUBERNETES_SERVICE_HOST not set (not running in a pod?)")?;
+    let port = std::env::var("KUBERNETES_SERVICE_PORT")
+        .context("KUBERNETES_SERVICE_PORT not set (not running in a pod?)")?;
+    in_cluster_client_from(
+        &host,
+        &port,
+        std::path::Path::new(IN_CLUSTER_TOKEN_PATH),
+        std::path::Path::new(IN_CLUSTER_CA_PATH),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // HyperApiClient — HTTP/1.1 over TLS client
 //
@@ -127,7 +286,7 @@ pub struct HyperApiClient {
     /// TLS connector built from kubeconfig credentials.
     pub connector: TlsConnector,
     /// Optional bearer token added as `Authorization: Bearer <token>`.
-    pub bearer: Option<String>,
+    pub bearer: Option<BearerSource>,
 }
 
 /// Total budget for a non-watch request/response cycle (connect through body
@@ -171,6 +330,13 @@ fn tls_server_name(host: &str) -> anyhow::Result<rustls::pki_types::ServerName<'
 }
 
 impl HyperApiClient {
+    /// Current `Authorization` header value, if a bearer source is set.
+    fn authorization(&self) -> Option<String> {
+        self.bearer
+            .as_ref()
+            .map(|b| format!("Bearer {}", b.token()))
+    }
+
     /// Parse `server` + `path` into (host, port) for TCP connect.
     fn parse_addr(server: &str, path: &str) -> anyhow::Result<(String, u16, String)> {
         let uri: hyper::Uri = format!("{server}{path}").parse().context("parse URI")?;
@@ -271,8 +437,8 @@ impl HyperApiClient {
                     .header("Content-Type", content_type)
                     .header("Content-Length", body_bytes.len().to_string());
             }
-            if let Some(tok) = &self.bearer {
-                builder = builder.header("Authorization", format!("Bearer {tok}"));
+            if let Some(h) = self.authorization() {
+                builder = builder.header("Authorization", h);
             }
             let req = builder
                 .body(http_body_util::Full::new(body_bytes))
@@ -331,8 +497,8 @@ impl HyperApiClient {
                 .uri(path)
                 .header("Host", &host)
                 .header("Accept", "application/json");
-            if let Some(tok) = &self.bearer {
-                builder = builder.header("Authorization", format!("Bearer {tok}"));
+            if let Some(h) = self.authorization() {
+                builder = builder.header("Authorization", h);
             }
             let req = builder
                 .body(http_body_util::Empty::<bytes::Bytes>::new())
@@ -1213,11 +1379,202 @@ mod tests {
         let client = HyperApiClient {
             server: "https://127.0.0.1:6443".to_owned(),
             connector,
-            bearer: Some("my-token".to_owned()),
+            bearer: Some(BearerSource::Static("my-token".to_owned())),
         };
-        assert_eq!(client.bearer.as_deref(), Some("my-token"));
+        assert_eq!(client.authorization().as_deref(), Some("Bearer my-token"));
         // bearer = None must also be constructable (scheduler's path today).
         // (We only check the field; construction is what matters for the compiler.)
         drop(client);
+    }
+
+    // ---------------------------------------------------------------------------
+    // In-cluster ServiceAccount auth
+    // ---------------------------------------------------------------------------
+
+    /// A bare IPv6 service host must be bracketed, otherwise the URL parses the
+    /// address as host:port garbage and the controller can never reach an
+    /// IPv6-only cluster's apiserver.
+    #[test]
+    fn in_cluster_server_url_brackets_ipv6_literals() {
+        assert_eq!(
+            in_cluster_server_url("fd00:10:96::1", "443").unwrap(),
+            "https://[fd00:10:96::1]:443"
+        );
+        assert_eq!(
+            in_cluster_server_url("[fd00::1]", "6443").unwrap(),
+            "https://[fd00::1]:6443"
+        );
+    }
+
+    #[test]
+    fn in_cluster_server_url_leaves_ipv4_and_dns_hosts_alone() {
+        assert_eq!(
+            in_cluster_server_url("10.96.0.1", "443").unwrap(),
+            "https://10.96.0.1:443"
+        );
+        assert_eq!(
+            in_cluster_server_url("kubernetes.default.svc", "443\n").unwrap(),
+            "https://kubernetes.default.svc:443"
+        );
+    }
+
+    /// Missing/garbage env must fail at startup, not produce a URL that fails
+    /// obscurely on the first request.
+    #[test]
+    fn in_cluster_server_url_rejects_empty_host_and_bad_port() {
+        assert!(in_cluster_server_url("", "443").is_err());
+        assert!(in_cluster_server_url("10.0.0.1", "").is_err());
+        assert!(in_cluster_server_url("10.0.0.1", "https").is_err());
+    }
+
+    /// The kubelet rewrites the projected token ~every 48 minutes; a client that
+    /// never re-reads it starts getting 401s after the original expires.
+    #[test]
+    fn token_file_picks_up_rotated_token_after_refresh_interval() {
+        let path = write_temp_file("tok-1\n", "token-rotate");
+        let tf = TokenFile::with_refresh(&path, std::time::Duration::ZERO).unwrap();
+        assert_eq!(tf.token(), "tok-1", "trailing newline must be trimmed");
+        std::fs::write(&path, "tok-2\n").unwrap();
+        assert_eq!(tf.token(), "tok-2");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Within the refresh interval the file must not be hit per request.
+    #[test]
+    fn token_file_caches_within_refresh_interval() {
+        let path = write_temp_file("tok-1", "token-cache");
+        let tf = TokenFile::with_refresh(&path, std::time::Duration::from_secs(3600)).unwrap();
+        std::fs::write(&path, "tok-2").unwrap();
+        assert_eq!(tf.token(), "tok-1");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A transient read failure (e.g. mid-swap) must not drop auth: the old
+    /// token stays valid until its own expiry.
+    #[test]
+    fn token_file_keeps_previous_token_when_refresh_fails() {
+        let path = write_temp_file("tok-1", "token-fail");
+        let tf = TokenFile::with_refresh(&path, std::time::Duration::ZERO).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(tf.token(), "tok-1");
+        std::fs::write(&path, "  ").unwrap();
+        assert_eq!(tf.token(), "tok-1", "an empty file is not a valid token");
+        std::fs::write(&path, "tok-3").unwrap();
+        assert_eq!(tf.token(), "tok-3", "must recover once the file is valid");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A missing or empty token must fail at construction so a misconfigured pod
+    /// crashes at startup rather than sending unauthenticated requests.
+    #[test]
+    fn token_file_new_fails_on_missing_or_empty_file() {
+        let missing = std::env::temp_dir().join("politeia-no-such-token");
+        assert!(TokenFile::new(&missing).is_err());
+        let path = write_temp_file("\n", "token-empty");
+        assert!(TokenFile::new(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn bearer_source_file_yields_authorization_header_with_current_token() {
+        let path = write_temp_file("abc", "token-header");
+        let (ca_pem, _, _) = make_test_certs();
+        let ca = rustls_pemfile::certs(&mut ca_pem.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let client = HyperApiClient {
+            server: "https://127.0.0.1:1".to_owned(),
+            connector: build_ca_only_tls_connector(&ca).unwrap(),
+            bearer: Some(BearerSource::File(
+                TokenFile::with_refresh(&path, std::time::Duration::ZERO).unwrap(),
+            )),
+        };
+        assert_eq!(client.authorization().as_deref(), Some("Bearer abc"));
+        std::fs::write(&path, "def").unwrap();
+        assert_eq!(client.authorization().as_deref(), Some("Bearer def"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ca_only_connector_rejects_empty_ca_set() {
+        assert!(build_ca_only_tls_connector(&[]).is_err());
+    }
+
+    /// Loader failures must be loud: no CA means TLS verification cannot be
+    /// configured, and we must never fall back to skipping verification.
+    #[test]
+    fn in_cluster_client_from_fails_without_usable_ca_or_token() {
+        let token = write_temp_file("tok", "ic-token");
+        let junk = write_temp_file("not a pem", "ic-junk-ca");
+        let missing = std::env::temp_dir().join("politeia-no-such-ca");
+        assert!(in_cluster_client_from("10.0.0.1", "443", &token, &junk).is_err());
+        assert!(in_cluster_client_from("10.0.0.1", "443", &token, &missing).is_err());
+        let (ca_pem, _, _) = make_test_certs();
+        let ca = write_temp_file(&ca_pem, "ic-ca");
+        let no_token = std::env::temp_dir().join("politeia-no-such-token2");
+        assert!(in_cluster_client_from("10.0.0.1", "443", &no_token, &ca).is_err());
+        for p in [token, junk, ca] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// End to end: a CA-only client (no client cert) completes TLS against a
+    /// server that does not ask for client auth and sends the ServiceAccount
+    /// token as a bearer header.
+    #[tokio::test]
+    async fn in_cluster_client_authenticates_with_bearer_over_ca_only_tls() {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        rustls_post_quantum::provider().install_default().ok();
+
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::default();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = Issuer::new(ca_params, ca_key);
+        let leaf_key = KeyPair::generate().unwrap();
+        let mut leaf_params = CertificateParams::default();
+        leaf_params.subject_alt_names =
+            vec![rcgen::SanType::IpAddress("127.0.0.1".parse().unwrap())];
+        let leaf = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
+
+        let server_cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![leaf.der().clone()],
+                PrivateKeyDer::Pkcs8(leaf_key.serialize_der().into()),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(tcp).await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = tls.read(&mut buf).await.unwrap();
+            tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+            tls.shutdown().await.ok();
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+
+        let ca_file = write_temp_file(&pem_encode_str("CERTIFICATE", ca_cert.der()), "ic-e2e-ca");
+        let token_file = write_temp_file("sa-token\n", "ic-e2e-token");
+        let client =
+            in_cluster_client_from("127.0.0.1", &port.to_string(), &token_file, &ca_file).unwrap();
+        let (status, body) = client
+            .request(hyper::Method::GET, "/api/v1/nodes", None)
+            .await
+            .unwrap();
+        assert_eq!((status.as_u16(), body.as_str()), (200, "ok"));
+        let head = server.await.unwrap().to_ascii_lowercase();
+        assert!(
+            head.contains("authorization: bearer sa-token\r\n"),
+            "request must carry the SA token; got: {head}"
+        );
+        let _ = std::fs::remove_file(&ca_file);
+        let _ = std::fs::remove_file(&token_file);
     }
 }
