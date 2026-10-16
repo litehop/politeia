@@ -10,6 +10,8 @@ keywords    = ["kubernetes", "kubeconfig", "tls", "mtls", "rustls"]
 categories  = ["api-bindings", "network-programming"]
 exclude     = ["/temp", "/.claude", "/ai"]
 
+[workspace]
+
 [dependencies]
 anyhow          = "1"
 base64          = "0.23"
