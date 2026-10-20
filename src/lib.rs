@@ -133,6 +133,262 @@ pub fn build_ca_only_tls_connector(
 }
 
 // ---------------------------------------------------------------------------
+// File-path kubeconfig mode and live TLS material reload
+// ---------------------------------------------------------------------------
+
+/// How often file-backed TLS material is re-read by [`kubeconfig_client`].
+/// Rotation happens on a scale of days or hours, so 30s is prompt and costs
+/// three tiny file reads.
+pub const DEFAULT_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One PEM input of the TLS configuration: inline kubeconfig `-data` (fixed)
+/// or a file path (re-read on reload).
+enum PemSource {
+    Inline(Vec<u8>),
+    File(std::path::PathBuf),
+}
+
+impl PemSource {
+    fn read(&self) -> anyhow::Result<Vec<u8>> {
+        match self {
+            Self::Inline(b) => Ok(b.clone()),
+            Self::File(p) => std::fs::read(p).with_context(|| format!("reading {}", p.display())),
+        }
+    }
+}
+
+struct TlsSources {
+    ca: PemSource,
+    cert: PemSource,
+    key: PemSource,
+}
+
+impl TlsSources {
+    fn has_files(&self) -> bool {
+        [&self.ca, &self.cert, &self.key]
+            .iter()
+            .any(|s| matches!(s, PemSource::File(_)))
+    }
+
+    fn read(&self) -> anyhow::Result<[Vec<u8>; 3]> {
+        Ok([self.ca.read()?, self.cert.read()?, self.key.read()?])
+    }
+}
+
+/// Build an mTLS client config from PEM bytes. The CA input may be a bundle
+/// (every certificate is trusted, so a CA rotation can overlap old and new);
+/// the cert input may be a chain.
+///
+/// Uses the post-quantum provider explicitly rather than the process default,
+/// so the hybrid X25519MLKEM768 group is offered regardless of what else
+/// installed a default.
+fn build_client_config(
+    ca_pem: &[u8],
+    cert_pem: &[u8],
+    key_pem: &[u8],
+) -> anyhow::Result<Arc<rustls::ClientConfig>> {
+    let mut root_store = rustls::RootCertStore::empty();
+    for ca in CertificateDer::pem_slice_iter(ca_pem) {
+        root_store
+            .add(ca.context("parse CA PEM")?)
+            .context("add CA cert to root store")?;
+    }
+    anyhow::ensure!(!root_store.is_empty(), "no CA certificates in CA PEM");
+
+    let chain = CertificateDer::pem_slice_iter(cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .context("parse client cert PEM")?;
+    anyhow::ensure!(!chain.is_empty(), "no certificate in client cert PEM");
+    let key = PrivateKeyDer::from_pem_slice(key_pem).context("parse client key PEM")?;
+
+    let config =
+        rustls::ClientConfig::builder_with_provider(Arc::new(rustls_post_quantum::provider()))
+            .with_safe_default_protocol_versions()
+            .context("select TLS protocol versions")?
+            .with_root_certificates(root_store)
+            .with_client_auth_cert(chain, key)
+            .context("configure mTLS client cert (cert/key mismatch?)")?;
+    Ok(Arc::new(config))
+}
+
+struct SwapState {
+    connector: TlsConnector,
+    generation: u64,
+    last_check: std::time::Instant,
+    /// Input bytes of the last attempted build, successful or not, so an
+    /// unchanged bad file is logged once and a changed one is retried.
+    seen: [Vec<u8>; 3],
+}
+
+struct Reloader {
+    sources: TlsSources,
+    interval: std::time::Duration,
+}
+
+/// A [`TlsConnector`] that can be replaced while in use. New connections take
+/// the current connector; [`Self::generation`] lets a long-lived connection
+/// notice it was made with superseded material.
+///
+/// File-backed material is compared by content every reload interval rather
+/// than by mtime: mtime has coarse granularity on some filesystems and is
+/// preserved by some copy tools, so a same-size replacement can go unnoticed,
+/// whereas the inputs are a few KB. A failed rebuild (unparsable, half-written
+/// or mismatched cert/key, empty CA) keeps the previous connector.
+pub struct SwapConnector {
+    state: std::sync::Mutex<SwapState>,
+    reload: Option<Reloader>,
+}
+
+impl From<TlsConnector> for SwapConnector {
+    /// A connector that never changes.
+    fn from(connector: TlsConnector) -> Self {
+        Self {
+            state: std::sync::Mutex::new(SwapState {
+                connector,
+                generation: 0,
+                last_check: std::time::Instant::now(),
+                seen: Default::default(),
+            }),
+            reload: None,
+        }
+    }
+}
+
+impl SwapConnector {
+    fn from_sources(
+        sources: TlsSources,
+        interval: Option<std::time::Duration>,
+    ) -> anyhow::Result<Self> {
+        let seen = sources.read()?;
+        let config = build_client_config(&seen[0], &seen[1], &seen[2])?;
+        let reload = interval
+            .filter(|_| sources.has_files())
+            .map(|interval| Reloader { sources, interval });
+        Ok(Self {
+            state: std::sync::Mutex::new(SwapState {
+                connector: TlsConnector::from(config),
+                generation: 0,
+                last_check: std::time::Instant::now(),
+                seen,
+            }),
+            reload,
+        })
+    }
+
+    fn refresh(&self, state: &mut SwapState) {
+        let Some(reload) = &self.reload else { return };
+        if state.last_check.elapsed() < reload.interval {
+            return;
+        }
+        state.last_check = std::time::Instant::now();
+        let bytes = match reload.sources.read() {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("TLS material reload: keeping previous connector: {e:#}");
+                return;
+            }
+        };
+        if bytes == state.seen {
+            return;
+        }
+        match build_client_config(&bytes[0], &bytes[1], &bytes[2]) {
+            Ok(config) => {
+                state.connector = TlsConnector::from(config);
+                state.generation += 1;
+                tracing::info!(
+                    generation = state.generation,
+                    "TLS material changed on disk; new connections use it"
+                );
+            }
+            Err(e) => error!("TLS material reload: keeping previous connector: {e:#}"),
+        }
+        state.seen = bytes;
+    }
+
+    /// The current connector and its generation, reloading first if due.
+    pub fn current(&self) -> (TlsConnector, u64) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.refresh(&mut state);
+        (state.connector.clone(), state.generation)
+    }
+
+    /// The current generation, reloading first if due. It increases each time
+    /// the connector is replaced.
+    pub fn generation(&self) -> u64 {
+        self.current().1
+    }
+
+    /// Resolves once the connector is newer than `generation`; never resolves
+    /// for a connector that cannot change.
+    async fn superseded(&self, generation: u64) {
+        let Some(reload) = &self.reload else {
+            return std::future::pending().await;
+        };
+        loop {
+            tokio::time::sleep(reload.interval).await;
+            if self.generation() != generation {
+                return;
+            }
+        }
+    }
+}
+
+fn strip_quotes(v: &str) -> &str {
+    v.trim().trim_matches(|c| c == '"' || c == '\'')
+}
+
+/// Build a client from a kubeconfig, honouring both inline `*-data` fields and
+/// `certificate-authority` / `client-certificate` / `client-key` file paths
+/// (relative paths resolve against the kubeconfig's directory, as client-go
+/// does). File-backed material is reloaded every [`DEFAULT_RELOAD_INTERVAL`].
+pub fn kubeconfig_client(path: &str) -> anyhow::Result<HyperApiClient> {
+    kubeconfig_client_with_reload(path, Some(DEFAULT_RELOAD_INTERVAL))
+}
+
+/// [`kubeconfig_client`] with an explicit reload interval; `None` disables
+/// reloading.
+pub fn kubeconfig_client_with_reload(
+    path: &str,
+    reload: Option<std::time::Duration>,
+) -> anyhow::Result<HyperApiClient> {
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading kubeconfig {path}"))?;
+    let dir = std::path::Path::new(path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new(""));
+    let b64 = base64::engine::general_purpose::STANDARD;
+
+    let source = |data_key: &str, path_key: &str| -> anyhow::Result<PemSource> {
+        if let Some(d) = extract_yaml_value(&raw, data_key) {
+            let bytes = b64
+                .decode(d.trim())
+                .with_context(|| format!("decode kubeconfig {data_key}"))?;
+            return Ok(PemSource::Inline(bytes));
+        }
+        let p = extract_yaml_value(&raw, path_key)
+            .map(strip_quotes)
+            .filter(|p| !p.is_empty())
+            .with_context(|| format!("kubeconfig: missing {data_key} or {path_key}"))?;
+        Ok(PemSource::File(dir.join(p)))
+    };
+
+    let server = extract_yaml_value(&raw, "server:")
+        .map(strip_quotes)
+        .context("kubeconfig: missing server")?
+        .to_owned();
+    let sources = TlsSources {
+        ca: source("certificate-authority-data:", "certificate-authority:")?,
+        cert: source("client-certificate-data:", "client-certificate:")?,
+        key: source("client-key-data:", "client-key:")?,
+    };
+    Ok(HyperApiClient {
+        server,
+        connector: SwapConnector::from_sources(sources, reload)?,
+        bearer: None,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Bearer tokens and in-cluster configuration
 // ---------------------------------------------------------------------------
 
@@ -282,7 +538,7 @@ pub fn in_cluster_client_from(
         build_ca_only_tls_connector(&cas).with_context(|| format!("CA {}", ca_path.display()))?;
     Ok(HyperApiClient {
         server,
-        connector,
+        connector: connector.into(),
         bearer: Some(BearerSource::File(TokenFile::new(token_path)?)),
     })
 }
@@ -315,8 +571,9 @@ pub fn in_cluster_client() -> anyhow::Result<HyperApiClient> {
 pub struct HyperApiClient {
     /// Base URL of the API server, e.g. "https://127.0.0.1:6443".
     pub server: String,
-    /// TLS connector built from kubeconfig credentials.
-    pub connector: TlsConnector,
+    /// TLS connector built from kubeconfig credentials; convert a plain
+    /// [`TlsConnector`] with `.into()` for a fixed one.
+    pub connector: SwapConnector,
     /// Optional bearer token added as `Authorization: Bearer <token>`.
     pub bearer: Option<BearerSource>,
 }
@@ -378,22 +635,23 @@ impl HyperApiClient {
         Ok((host, port, addr))
     }
 
-    /// Open a fresh TLS connection to the API server.
+    /// Open a fresh TLS connection to the API server, returning it with the
+    /// generation of the connector that made it.
     async fn connect(
         &self,
         host: &str,
         addr: &str,
-    ) -> anyhow::Result<TokioIo<tokio_rustls::client::TlsStream<TcpStream>>> {
+    ) -> anyhow::Result<(TokioIo<tokio_rustls::client::TlsStream<TcpStream>>, u64)> {
         let stream = TcpStream::connect(addr)
             .await
             .with_context(|| format!("TCP connect to {addr}"))?;
         let server_name = tls_server_name(host)?;
-        let tls = self
-            .connector
+        let (connector, generation) = self.connector.current();
+        let tls = connector
             .connect(server_name, stream)
             .await
             .context("TLS handshake")?;
-        Ok(TokioIo::new(tls))
+        Ok((TokioIo::new(tls), generation))
     }
 
     /// Send an HTTP request and return the response body as bytes.
@@ -443,7 +701,7 @@ impl HyperApiClient {
     ) -> anyhow::Result<(hyper::StatusCode, String)> {
         let call = async move {
             let (host, _port, addr) = Self::parse_addr(&self.server, path)?;
-            let io = self.connect(&host, &addr).await?;
+            let (io, _) = self.connect(&host, &addr).await?;
 
             let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
                 .await
@@ -513,7 +771,7 @@ impl HyperApiClient {
         // indefinitely, guarded instead by the per-frame idle timeout.
         let setup = async move {
             let (host, _port, addr) = Self::parse_addr(&self.server, path)?;
-            let io = self.connect(&host, &addr).await?;
+            let (io, generation) = self.connect(&host, &addr).await?;
 
             let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
                 .await
@@ -543,16 +801,26 @@ impl HyperApiClient {
             if !resp.status().is_success() {
                 anyhow::bail!("watch returned HTTP {}", resp.status());
             }
-            anyhow::Ok(resp)
+            anyhow::Ok((resp, generation))
         };
 
-        let resp = tokio::time::timeout(REQUEST_TIMEOUT, setup)
+        let (resp, generation) = tokio::time::timeout(REQUEST_TIMEOUT, setup)
             .await
             .with_context(|| {
                 format!("watch connect to {path} timed out after {REQUEST_TIMEOUT:?}")
             })??;
 
-        read_watch_frames(resp.into_body(), WATCH_IDLE_TIMEOUT, path, on_event).await
+        // A watch can outlive the TLS material it was opened with, and would
+        // keep trusting a rotated-out CA and presenting a rotated-out client
+        // cert. Ending it cleanly makes the caller's reconnect loop reopen it
+        // on the new connector.
+        tokio::select! {
+            r = read_watch_frames(resp.into_body(), WATCH_IDLE_TIMEOUT, path, on_event) => r,
+            () = self.connector.superseded(generation) => {
+                warn!("watch on {path} ended: TLS material was replaced; reconnect to use it");
+                Ok(())
+            }
+        }
     }
 }
 
@@ -631,6 +899,9 @@ pub fn drain_watch_buffer(buf: &mut String, handler: &mut impl FnMut(Value)) {
         }
     }
 }
+
+#[cfg(test)]
+mod reload_tests;
 
 #[cfg(test)]
 mod tests {
@@ -977,7 +1248,7 @@ mod tests {
         // Port 19999 is almost certainly not listening — TCP connect must fail.
         let client = HyperApiClient {
             server: "https://127.0.0.1:19999".to_owned(),
-            connector,
+            connector: connector.into(),
             bearer: None,
         };
         let result = client
@@ -1031,7 +1302,7 @@ mod tests {
 
         let client = HyperApiClient {
             server: format!("https://127.0.0.1:{port}"),
-            connector,
+            connector: connector.into(),
             bearer: None,
         };
 
@@ -1194,7 +1465,7 @@ mod tests {
 
         let client = HyperApiClient {
             server: format!("https://127.0.0.1:{port}"),
-            connector,
+            connector: connector.into(),
             bearer: None,
         };
 
@@ -1406,7 +1677,7 @@ mod tests {
             .with_no_client_auth();
         let client = HyperApiClient {
             server: format!("https://[::1]:{port}"),
-            connector: TlsConnector::from(Arc::new(client_cfg)),
+            connector: TlsConnector::from(Arc::new(client_cfg)).into(),
             bearer: None,
         };
         let (host, _, addr) = HyperApiClient::parse_addr(&client.server, "/").unwrap();
@@ -1432,7 +1703,7 @@ mod tests {
 
         let client = HyperApiClient {
             server: "https://127.0.0.1:6443".to_owned(),
-            connector,
+            connector: connector.into(),
             bearer: Some(BearerSource::Static("my-token".to_owned())),
         };
         assert_eq!(client.authorization().as_deref(), Some("Bearer my-token"));
@@ -1538,7 +1809,7 @@ mod tests {
             .unwrap();
         let client = HyperApiClient {
             server: "https://127.0.0.1:1".to_owned(),
-            connector: build_ca_only_tls_connector(&ca).unwrap(),
+            connector: build_ca_only_tls_connector(&ca).unwrap().into(),
             bearer: Some(BearerSource::File(
                 TokenFile::with_refresh(&path, std::time::Duration::ZERO).unwrap(),
             )),
