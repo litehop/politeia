@@ -1,6 +1,6 @@
 [package]
 name        = "politeia"
-version     = "0.3.0"
+version     = "0.3.1"
 edition     = "2021"
 license     = "Apache-2.0"
 description = "kubeconfig parsing, mTLS TlsConnector construction, and a minimal hyper HTTP/1.1 API client with watch-streaming"
