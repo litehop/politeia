@@ -31,38 +31,42 @@ pub struct ClientCreds {
 /// Parse a kubeconfig file and return TLS credentials.
 ///
 /// Performs manual YAML field extraction without a serde_yaml dependency.
-/// Expects the fixed kubeconfig structure with inline base64 CA cert, client
-/// cert, and client key data.
+/// Expects the fixed kubeconfig structure. Each of CA cert, client cert and
+/// client key is read from inline base64 `*-data` or, as in client-go, from a
+/// `certificate-authority` / `client-certificate` / `client-key` file path
+/// (relative paths resolve against the kubeconfig's directory); `*-data` wins
+/// when both are present.
 pub fn parse_kubeconfig(path: &str) -> anyhow::Result<ClientCreds> {
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("reading kubeconfig {path}"))?;
-
-    let b64 = base64::engine::general_purpose::STANDARD;
+    let dir = std::path::Path::new(path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new(""));
 
     let server = extract_yaml_value(&raw, "server:").context("kubeconfig: missing server")?;
-    let ca_data = extract_yaml_value(&raw, "certificate-authority-data:")
-        .context("kubeconfig: missing certificate-authority-data")?;
-    let cert_data = extract_yaml_value(&raw, "client-certificate-data:")
-        .context("kubeconfig: missing client-certificate-data")?;
-    let key_data = extract_yaml_value(&raw, "client-key-data:")
-        .context("kubeconfig: missing client-key-data")?;
+    let ca_pem = pem_source(
+        &raw,
+        dir,
+        "certificate-authority-data:",
+        "certificate-authority:",
+    )?
+    .read()?;
+    let cert_pem =
+        pem_source(&raw, dir, "client-certificate-data:", "client-certificate:")?.read()?;
+    let key_pem = pem_source(&raw, dir, "client-key-data:", "client-key:")?.read()?;
 
-    let ca_pem = b64.decode(ca_data.trim()).context("decode CA cert")?;
-    let cert_pem = b64.decode(cert_data.trim()).context("decode client cert")?;
-    let key_pem = b64.decode(key_data.trim()).context("decode client key")?;
-
-    // The kubeconfig fields hold base64(PEM); rustls needs DER.
+    // The kubeconfig fields hold PEM; rustls needs DER.
     // pem_slice_iter strips the PEM envelope and yields raw DER.
     let ca_cert = CertificateDer::pem_slice_iter(&ca_pem)
         .next()
-        .context("no certificate in kubeconfig certificate-authority-data")?
+        .context("no certificate in kubeconfig certificate-authority")?
         .context("parse CA cert PEM")?;
     let client_cert = CertificateDer::pem_slice_iter(&cert_pem)
         .next()
-        .context("no certificate in kubeconfig client-certificate-data")?
+        .context("no certificate in kubeconfig client-certificate")?
         .context("parse client cert PEM")?;
     let client_key = PrivateKeyDer::from_pem_slice(&key_pem)
-        .context("parse private key in kubeconfig client-key-data")?;
+        .context("parse private key in kubeconfig client-key")?;
 
     Ok(ClientCreds {
         server: server.trim().to_owned(),
@@ -337,6 +341,28 @@ fn strip_quotes(v: &str) -> &str {
     v.trim().trim_matches(|c| c == '"' || c == '\'')
 }
 
+/// Locate one PEM input in kubeconfig text: inline base64 `data_key` wins over
+/// the `path_key` file, which resolves against `dir` unless absolute (client-go
+/// `dataFromSliceOrFile` / `ResolvePaths`).
+fn pem_source(
+    raw: &str,
+    dir: &std::path::Path,
+    data_key: &str,
+    path_key: &str,
+) -> anyhow::Result<PemSource> {
+    if let Some(d) = extract_yaml_value(raw, data_key).filter(|d| !d.is_empty()) {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(d.trim())
+            .with_context(|| format!("decode kubeconfig {data_key}"))?;
+        return Ok(PemSource::Inline(bytes));
+    }
+    let p = extract_yaml_value(raw, path_key)
+        .map(strip_quotes)
+        .filter(|p| !p.is_empty())
+        .with_context(|| format!("kubeconfig: missing {data_key} or {path_key}"))?;
+    Ok(PemSource::File(dir.join(p)))
+}
+
 /// Build a client from a kubeconfig, honouring both inline `*-data` fields and
 /// `certificate-authority` / `client-certificate` / `client-key` file paths
 /// (relative paths resolve against the kubeconfig's directory, as client-go
@@ -356,21 +382,7 @@ pub fn kubeconfig_client_with_reload(
     let dir = std::path::Path::new(path)
         .parent()
         .unwrap_or_else(|| std::path::Path::new(""));
-    let b64 = base64::engine::general_purpose::STANDARD;
-
-    let source = |data_key: &str, path_key: &str| -> anyhow::Result<PemSource> {
-        if let Some(d) = extract_yaml_value(&raw, data_key) {
-            let bytes = b64
-                .decode(d.trim())
-                .with_context(|| format!("decode kubeconfig {data_key}"))?;
-            return Ok(PemSource::Inline(bytes));
-        }
-        let p = extract_yaml_value(&raw, path_key)
-            .map(strip_quotes)
-            .filter(|p| !p.is_empty())
-            .with_context(|| format!("kubeconfig: missing {data_key} or {path_key}"))?;
-        Ok(PemSource::File(dir.join(p)))
-    };
+    let source = |data_key: &str, path_key: &str| pem_source(&raw, dir, data_key, path_key);
 
     let server = extract_yaml_value(&raw, "server:")
         .map(strip_quotes)
@@ -1124,8 +1136,8 @@ mod tests {
         assert!(result.is_err(), "bad base64 must return Err");
         let msg = format!("{:#}", result.err().unwrap());
         assert!(
-            msg.contains("decode CA cert"),
-            "error must mention decode CA cert; got: {msg}"
+            msg.contains("decode kubeconfig certificate-authority-data"),
+            "error must mention decode failure of the CA field; got: {msg}"
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -1178,9 +1190,93 @@ mod tests {
             result.err().expect("empty cert chain must return Err")
         );
         assert!(
-            msg.contains("no certificate in kubeconfig client-certificate-data"),
+            msg.contains("no certificate in kubeconfig client-certificate"),
             "error must name the empty client cert field; got: {msg}"
         );
+    }
+
+    fn write_pem_dir(tag: &str) -> (std::path::PathBuf, String, String, String) {
+        let (ca, cert, key) = make_test_certs();
+        let dir = std::env::temp_dir().join(format!(
+            "politeia-kc-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ca.crt"), &ca).unwrap();
+        std::fs::write(dir.join("client.crt"), &cert).unwrap();
+        std::fs::write(dir.join("client.key"), &key).unwrap();
+        (dir, ca, cert, key)
+    }
+
+    /// k3s/kubeadm kubeconfigs reference files; rejecting them forces users to
+    /// flatten the kubeconfig by hand. Absolute paths must load.
+    #[test]
+    fn parse_kubeconfig_reads_absolute_file_path_credentials() {
+        let (dir, ..) = write_pem_dir("abs");
+        let yaml = format!(
+            "server: https://127.0.0.1:6443\ncertificate-authority: {d}/ca.crt\n\
+             client-certificate: {d}/client.crt\nclient-key: {d}/client.key\n",
+            d = dir.display()
+        );
+        let kc = dir.join("kubeconfig");
+        std::fs::write(&kc, yaml).unwrap();
+        let creds = parse_kubeconfig(kc.to_str().unwrap()).expect("file-path creds must parse");
+        assert!(!creds.ca_cert.is_empty() && !creds.client_cert.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// client-go resolves relative paths against the kubeconfig's directory,
+    /// not the process CWD; resolving against CWD breaks any kubeconfig used
+    /// from another directory.
+    #[test]
+    fn parse_kubeconfig_resolves_relative_paths_against_kubeconfig_dir() {
+        let (dir, ..) = write_pem_dir("rel");
+        let yaml = "server: https://127.0.0.1:6443\ncertificate-authority: ca.crt\n\
+                    client-certificate: \"client.crt\"\nclient-key: client.key\n";
+        let kc = dir.join("kubeconfig");
+        std::fs::write(&kc, yaml).unwrap();
+        let res = parse_kubeconfig(kc.to_str().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+        res.expect("relative paths must resolve against the kubeconfig dir");
+    }
+
+    /// client-go prefers inline data over the file when both are set; a stale
+    /// file must not override the inline credential.
+    #[test]
+    fn parse_kubeconfig_inline_data_wins_over_file_path() {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let (ca, cert, key) = make_test_certs();
+        let yaml = format!(
+            "server: https://127.0.0.1:6443\n\
+             certificate-authority-data: {}\ncertificate-authority: /nonexistent/ca.crt\n\
+             client-certificate-data: {}\nclient-certificate: /nonexistent/c.crt\n\
+             client-key-data: {}\nclient-key: /nonexistent/k.key\n",
+            b64.encode(ca.as_bytes()),
+            b64.encode(cert.as_bytes()),
+            b64.encode(key.as_bytes()),
+        );
+        let path = write_temp_file(&yaml, "data-wins");
+        let res = parse_kubeconfig(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        res.expect("inline data must win; the nonexistent files must never be read");
+    }
+
+    /// A referenced file that does not exist must be named in the error so the
+    /// user can fix the path, rather than a generic "missing" message.
+    #[test]
+    fn parse_kubeconfig_missing_credential_file_error_names_the_path() {
+        let (dir, ..) = write_pem_dir("missing");
+        let yaml = "server: https://127.0.0.1:6443\ncertificate-authority: no-such-ca.crt\n\
+                    client-certificate: client.crt\nclient-key: client.key\n";
+        let kc = dir.join("kubeconfig");
+        std::fs::write(&kc, yaml).unwrap();
+        let res = parse_kubeconfig(kc.to_str().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+        let msg = format!("{:#}", res.err().expect("missing file must error"));
+        assert!(msg.contains("no-such-ca.crt"), "got: {msg}");
     }
 
     // ---------------------------------------------------------------------------
